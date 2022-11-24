@@ -1,0 +1,360 @@
+send an email alert from MS SQL Server Instance when a given disk space is lower than a specified threshold
+
+--Tables:
+
+USE [Reporting];
+GO
+SET ANSI_NULLS ON;
+GO
+SET QUOTED_IDENTIFIER ON;
+GO
+CREATE TABLE [dbo].[Disk_Space_Alert_Threshold] (
+[Disk_Space_Alert_Threshold_Id] int IDENTITY(1, 1) NOT NULL,
+[Alert_Class] varchar(25) NULL,
+[Alert_Threshold_Value] int NULL)
+ON [PRIMARY]
+WITH (DATA_COMPRESSION = NONE);
+GO
+ALTER TABLE [dbo].[Disk_Space_Alert_Threshold] SET (LOCK_ESCALATION = TABLE);
+GO
+
+-- This table holds a red and a yellow values.
+-- So disk space availability for the yellow alert is set to 15%
+-- And the red alert is set to 10%
+SET IDENTITY_INSERT [dbo].[Disk_Space_Alert_Threshold] ON
+
+INSERT [dbo].[Disk_Space_Alert_Threshold](
+        [Disk_Space_Alert_Threshold_Id],
+        [Alert_Class],
+        [Alert_Threshold_Value])
+VALUES
+  (
+    1,
+    N'Red',
+    10)
+
+INSERT[dbo].[Disk_Space_Alert_Threshold](
+        [Disk_Space_Alert_Threshold_Id],
+        [Alert_Class],
+        [Alert_Threshold_Value])
+VALUES
+  (
+    2,
+    N'Yellow',
+    15)
+SET IDENTITY_INSERT [dbo].[Disk_Space_Alert_Threshold] OFF
+
+===============================================================================
+USE [Reporting];
+GO
+SET ANSI_NULLS ON;
+GO
+SET QUOTED_IDENTIFIER ON;
+GO
+CREATE TABLE [dbo].[Email_List] (
+[Email_List_Id] int IDENTITY(1, 1) NOT NULL,
+[First_Name] varchar(255) NULL,
+[Last_Name] varchar(255) NULL,
+[Email_Address] varchar(255) NULL,
+[Active] bit NULL)
+ON [PRIMARY]
+WITH (DATA_COMPRESSION = NONE);
+GO
+ALTER TABLE [dbo].[Email_List] SET (LOCK_ESCALATION = TABLE);
+GO
+================================================================================
+-- This table holds the email addresses of the people you would like to be notified when the disk space is running low.
+SET IDENTITY_INSERT [dbo].[StaffEmailList] ON
+
+INSERT [dbo].[Email_List] (
+      [Email_List_Id]
+      ,[First_Name]
+      ,[Last_Name]
+      ,[Email_Address]
+      )
+VALUES (
+      1
+      ,N'Tony'
+      ,N'Stark'
+      ,N'T.S@starktech.com'
+      )
+
+SET IDENTITY_INSERT [dbo].[Email_List] OFF
+============================================================
+Store Procedure:
+
+USE [Reporting];
+GO
+SET ANSI_NULLS ON;
+GO
+SET QUOTED_IDENTIFIER ON;
+GO
+CREATE PROCEDURE [dbo].[Low_Disk_Space_Alert]
+WITH EXEC AS CALLER
+AS
+SET NOCOUNT ON
+
+IF OBJECT_ID('tempdb..#DiskSpaceStats') IS NOT NULL
+      DROP TABLE #DiskSpaceStats
+
+IF OBJECT_ID('tempdb..#DriveAlert') IS NOT NULL
+      DROP TABLE #DriveAlert
+
+DECLARE @profileName AS VARCHAR(128)
+DECLARE @thresholdRed AS INT
+DECLARE @thresholdYellow AS INT
+DECLARE @drive AS VARCHAR(5)
+DECLARE @sql AS VARCHAR(MAX)
+DECLARE @i AS INT
+DECLARE @j AS INT
+
+/*please note that you need to change the name for your SQL Server email profile at below*/
+SET @profileName = 'DBMailProfile'
+
+CREATE TABLE #DriveAlert (
+      AlertEntry VARCHAR(25)
+      ,AlertValue VARCHAR(25)
+      )
+
+SET @thresholdRed = (
+            SELECT Alert_Threshold_Value
+            FROM [Reporting].[dbo].[Disk_Space_Alert_Threshold]
+            WHERE Alert_Class = 'Red'
+            )
+
+SET @thresholdYellow = (
+            SELECT Alert_Threshold_Value
+            FROM [Reporting].[dbo].[Disk_Space_Alert_Threshold]
+            WHERE Alert_Class = 'Yellow'
+            )   
+
+declare @svrName varchar(255)
+declare @sql1 varchar(400)
+set @svrName = @@SERVERNAME
+set @sql1 = 'powershell.exe -c "Get-WmiObject -ComputerName ' + QUOTENAME(@svrName,'''') + ' -Class Win32_Volume -Filter ''DriveType = 3'' | select name,capacity,freespace | foreach{$_.name+''|''+$_.capacity/1048576+''%''+$_.freespace/1048576+''*''}"'
+
+--temporary table to hold the disk name, total space and free space value in to temporary table
+CREATE TABLE #output
+(line varchar(255))
+insert #output
+EXEC xp_cmdshell @sql1
+
+SELECT ROW_NUMBER() OVER (
+            ORDER BY AvailableDriveSpacePercentage ASC
+            ) AS RowNo
+      ,ObservationDT
+      ,Drive
+      ,AvailableDriveSpacePercentage
+      ,AvailableDriveSpaceGB
+      ,UsedDriveSpaceGB
+      ,TotalDriveSpaceGB
+INTO #DiskSpaceStats
+FROM (
+--script to retrieve the values in GB
+select
+DISTINCT GETDATE() AS ObservationDT,
+rtrim(ltrim(SUBSTRING(line,1,CHARINDEX('|',line) -1))) as Drive,
+   cast((round(cast(rtrim(ltrim(SUBSTRING(line,CHARINDEX('%',line)+1,
+   (CHARINDEX('*',line) -1)-CHARINDEX('%',line)) )) as Float) /1024 ,0))/ 
+   (round(cast(rtrim(ltrim(SUBSTRING(line,CHARINDEX('|',line)+1,
+   (CHARINDEX('%',line) -1)-CHARINDEX('|',line)) )) as Float)/1024,0))
+   *100 AS NUMERIC(8, 2))as AvailableDriveSpacePercentage,
+    round(cast(rtrim(ltrim(SUBSTRING(line,CHARINDEX('%',line)+1,
+   (CHARINDEX('*',line) -1)-CHARINDEX('%',line)) )) as Float) /1024 ,0)as 'AvailableDriveSpaceGB',
+   (round(cast(rtrim(ltrim(SUBSTRING(line,CHARINDEX('|',line)+1,
+   (CHARINDEX('%',line) -1)-CHARINDEX('|',line)) )) as Float)/1024,0))-
+   ( round(cast(rtrim(ltrim(SUBSTRING(line,CHARINDEX('%',line)+1,
+   (CHARINDEX('*',line) -1)-CHARINDEX('%',line)) )) as Float) /1024 ,0)) as   UsedDriveSpaceGB,
+   round(cast(rtrim(ltrim(SUBSTRING(line,CHARINDEX('|',line)+1,
+   (CHARINDEX('%',line) -1)-CHARINDEX('|',line)) )) as Float)/1024,0) as 'TotalDriveSpaceGB'
+from #output
+where line like '[A-Z][:]%'
+      ) AS r
+
+SET @i = 1
+SET @j = (
+            SELECT MAX(RowNo)
+            FROM #DiskSpaceStats
+            )
+WHILE @i <= @j
+BEGIN
+      SET @drive = (
+                  SELECT Drive
+                  FROM #DiskSpaceStats
+                  WHERE RowNo = @i
+                  )
+      SET @sql = 'DECLARE @alert AS VARCHAR(6)
+IF ' + CONVERT(VARCHAR(3), @thresholdYellow) + ' > (
+            SELECT AvailableDriveSpacePercentage
+            FROM #DiskSpaceStats
+            WHERE Drive = ''' + @drive + '''
+            )
+BEGIN
+SET @alert = ''YELLOW''
+END
+IF ' + CONVERT(VARCHAR(3), @thresholdRed) + ' > (
+            SELECT AvailableDriveSpacePercentage
+            FROM #DiskSpaceStats
+            WHERE Drive = ''' + @drive + '''
+            )
+BEGIN
+SET @alert = ''RED''
+END
+IF @alert IS NOT NULL
+BEGIN
+      SELECT AlertEntry
+      ,AlertValue
+      FROM (
+      SELECT ''Alert Class: '' AS AlertEntry
+      ,@alert AS AlertValue
+      UNION ALL
+      SELECT ''DateTime: '' AS AlertEntry
+      ,CONVERT(VARCHAR(30), ObservationDT)  AS AlertValue
+      FROM #DiskSpaceStats
+      WHERE Drive = ''' + @drive + '''
+      UNION ALL
+      SELECT ''Drive: '' AS AlertEntry
+      ,Drive AS AlertValue
+      FROM #DiskSpaceStats
+      WHERE Drive = ''' + @drive +
+            '''
+      UNION ALL
+      SELECT ''Percentage Available: '' AS AlertEntry
+      ,CONVERT(VARCHAR(10), AvailableDriveSpacePercentage) + ''%'' AS AlertValue
+      FROM #DiskSpaceStats
+      WHERE Drive = ''' + @drive + '''
+      UNION ALL
+      SELECT ''Available Space: '' AS AlertEntry
+      ,CONVERT(VARCHAR(10), AvailableDriveSpaceGB) + '' GB'' AS AlertValue
+      FROM #DiskSpaceStats
+      WHERE Drive = ''' + @drive + '''
+      UNION ALL
+      SELECT ''Used Space: '' AS AlertEntry
+      ,CONVERT(VARCHAR(10), UsedDriveSpaceGB) + '' GB'' AS AlertValue
+      FROM #DiskSpaceStats
+      WHERE Drive = ''' + @drive + '''
+      UNION ALL
+      SELECT ''Total Space: '' AS AlertEntry
+      ,CONVERT(VARCHAR(10), TotalDriveSpaceGB) + '' GB'' AS AlertValue
+      FROM #DiskSpaceStats
+      WHERE Drive = ''' + @drive + '''
+      UNION ALL
+      SELECT '' '' AS AlertEntry
+      ,'' '' AS AlertValue
+      ) AS alert
+END
+'
+      INSERT INTO #DriveAlert
+      EXEC (@sql)
+
+      SET @i = @i + 1
+END
+
+IF EXISTS (
+            SELECT *
+            FROM #DriveAlert
+            )
+
+BEGIN
+      DECLARE @emailList AS VARCHAR(MAX)
+      DECLARE @subjectMsg AS VARCHAR(255)
+      DECLARE @tableHTML NVARCHAR(MAX)
+
+      SET @emailList = (
+                  SELECT STUFF((
+                                    SELECT '; ' + Email_Address
+                                    FROM [Reporting].[dbo].[Email_List]
+                                    WHERE Active = 1
+                                    FOR XML PATH('')
+                                    ), 1, 1, '') AS Email_Address
+                  )
+      SET @subjectMsg = (
+                  SELECT @@SERVERNAME
+                  ) + ' Low Disk Space Alert'
+      SET @tableHTML = N'<style>
+      .tableFormat {
+            width:80%;
+            border:1px solid #C0C0C0;
+            border-collapse:collapse;
+            padding:5px;
+      }
+      .tableFormat th {
+            border:1px solid #C0C0C0;
+            padding:5px;
+            background:#F0F0F0;
+      }
+      .tableFormat td {
+            border:1px solid #C0C0C0;
+            text-align:right;
+            padding:5px;
+      }
+</style>' + N'<H1></H1>' + N'<table class="tableFormat" align="center">' + N'<tr><th>Description</th><th>Value</th></tr>' + CAST((
+                        SELECT td = AlertEntry
+                              ,''
+                              ,td = AlertValue
+                              ,''
+                        FROM #DriveAlert
+                        FOR XML PATH('tr')
+                              ,TYPE
+                        ) AS NVARCHAR(MAX)) + N'</table>';
+
+      DROP TABLE #DiskSpaceStats
+
+      SET @tableHTML = REPLACE(@tableHTML, '<td> </td>', '<td bgcolor="#F0F0F0"> </td>')
+      SET @tableHTML = REPLACE(@tableHTML, '<td>RED</td>', '<td bgcolor="red"><b>RED</b></td>')
+      SET @tableHTML = REPLACE(@tableHTML, '<td>YELLOW</td>', '<td bgcolor="yellow"><b>YELLOW</b></td>')
+
+      EXEC msdb.dbo.sp_send_dbmail @profile_name = @profileName
+            ,@recipients = @emailList
+            ,@body = @tableHTML
+            ,@subject = @subjectMsg
+            ,@importance = 'High'
+            ,@body_format = 'HTML';   
+
+DROP TABLE #output
+END
+GO
+=====================================================================
+--Job:
+-- This job simply scheduled to run the stored procedure every 10 minutes. Change as you wish.
+USE [master];
+GO
+DECLARE @JobID BINARY(16)
+
+EXECUTE msdb.dbo.sp_add_job @job_id = @JobID OUTPUT, @job_name = N'Low_Disk_Space_Alert',
+   @enabled = 1,
+   @owner_login_name = N'sa',
+   @description = N'No description available.',
+   @category_name = N'[Uncategorized (Local)]',
+   @notify_level_eventlog = 0,
+   @notify_level_email = 0,
+   @notify_level_netsend = 0,
+   @notify_level_page = 0,
+   @delete_level = 0;
+EXECUTE msdb.dbo.sp_add_jobstep @job_id = @JobID, @step_id = 1, @step_name = N' Low_Disk_Space_Alert_SP_Run',
+   @command = N'exec [dbo].[Low_Disk_Space_Alert]',
+   @database_name = N'Reporting',
+   @subsystem = N'TSQL',
+   @flags = 0,
+   @retry_attempts = 0,
+   @retry_interval = 0,
+   @on_success_step_id = 0,
+   @on_success_action = 1,
+   @on_fail_step_id = 0,
+   @on_fail_action = 2;
+EXECUTE msdb.dbo.sp_update_job @job_id = @JobID, @start_step_id = 1;
+EXECUTE msdb.dbo.sp_add_jobserver @job_id = @JobID, @server_name = N'(LOCAL)';
+EXECUTE msdb.dbo.sp_add_jobschedule @job_id = @JobID,
+        @name = N' Low_Disk_Space_Alert_Schedule',
+        @enabled = 1,
+        @freq_type = 4,
+        @active_start_date = 20210319,
+        @active_end_date = 99991231,
+        @freq_interval = 1,
+        @freq_subday_type = 4,
+        @freq_subday_interval = 10,
+        @freq_relative_interval = 1,
+        @freq_recurrence_factor = 1,
+        @active_start_time = 0,
+        @active_end_time = 235959;
+GO
